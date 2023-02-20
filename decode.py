@@ -10,31 +10,34 @@
 import base64
 import json
 import sys
-from typing import Callable, Dict, Optional, Sequence, Union
+from typing import Callable, Dict, Iterable, Iterator, Optional, Union, cast
 
-DecodedTagType = Union[int, Sequence[bytes]]
+DecodedTagType = Union[int, bytes]
 CustomDecoderType = Callable[[DecodedTagType], None]
 
 
 class Reader:
-    def __init__(self, data: Sequence[bytes], idx: int = 0, end: Optional[int] = None):
-        self._data: Sequence[bytes] = data
-        self._idx: int = idx
-        self._end: int = end if end is not None else len(data)
+    def __init__(self, data: bytes, idx: int = 0, end: Optional[int] = None):
+        if end is None:
+            end = len(data)
+        self._data: Iterator[int] = iter(data[idx:end])
         self._decoders: Dict[int, CustomDecoderType] = {}
 
     def register_decoder(self, tag: int, callback: CustomDecoderType) -> None:
         self._decoders[tag] = callback
 
     def read_byte(self) -> int:
-        if self.is_empty():
-            raise RuntimeError("hit end of data")
+        """Get the next byte from the message
 
-        res = int(self._data[self._idx])
-        self._idx +=1
-        return res
+        Raises StopIteration if we've hit the end of the input
+        """
+        return next(self._data)
 
     def read_int(self) -> int:
+        """Read a variable-length-encoded int from the message
+
+        Raises StopIteration if we hit the end of the input
+        """
         res = 0
         shift = 0
         while True:
@@ -44,32 +47,39 @@ class Reader:
                 return res
             shift += 7
 
-    def read_string(self) -> Sequence[bytes]:
+    def read_string(self) -> bytes:
+        """Read a string from the message
+
+        Raises StopIteration if we hit the end of the input
+        """
         length = self.read_int()
-        end = self._idx + length
-        if end > self._end:
-            raise RuntimeError("hit end of data")
 
-        res = self._data[self._idx:end]
-        self._idx = end
-        return res
+        def readn(n: int) -> Iterable[int]:
+            while n > 0:
+                yield self.read_byte()
+                n -= 1
 
-    def is_empty(self) -> bool:
-        return self._idx >= self._end
+        return bytearray(readn(length))
 
     def dump(self) -> None:
-        while not self.is_empty():
-            tag = self.read_byte()
+        """Dump the whole of the message"""
+        while True:
+            try:
+                tag = self.read_byte()
+            except StopIteration:
+                return
+
             typ = tag & 7
+            val: DecodedTagType
             if typ == 0:
                 val = self.read_int()
                 print("tag: %02x: val: %i" % (tag, val))
             elif typ == 2:
                 val = self.read_string()
                 if len(val) > 40:
-                    x = bytes.hex(val[:40]) + "..."
+                    x = val[:40].hex() + "..."
                 else:
-                    x = bytes.hex(val)
+                    x = val.hex()
                 print("tag: %02x: val: %s" % (tag, x))
             else:
                 raise RuntimeError(f"unknown tag type {typ}")
@@ -80,18 +90,24 @@ class Reader:
                 print("<<<")
 
 
-def decode_msg(body: Sequence[bytes]) -> None:
+def decode_msg(body: bytes) -> None:
     ver = int(body[0])
     print("Regular Olm message; ver: %02x" % (ver,))
+    # exclude the MAC
     reader = Reader(body, 1, len(body) - 8)
     reader.dump()
+    print("MAC:", body[-8:].hex())
 
 
-def decode_prekey(body: Sequence[bytes]) -> None:
+def decode_prekey(body: bytes) -> None:
     ver = int(body[0])
     print("Prekey message: ver: %02x" % (ver,))
     reader = Reader(body, 1)
-    reader.register_decoder(0x22, decode_msg)
+
+    def on_msg(msg: Union[int, bytes]) -> None:
+        decode_msg(cast(bytes, msg))
+
+    reader.register_decoder(0x22, on_msg)
 
     reader.dump()
 
@@ -111,8 +127,8 @@ def decode_unpadded_base64(input_string: str) -> bytes:
 if __name__ == "__main__":
     for line in sys.stdin:
         msg = json.loads(line)
-        typ = msg['type']
-        body = decode_unpadded_base64(msg['body'])
+        typ = msg["type"]
+        body = decode_unpadded_base64(msg["body"])
 
         if typ == 0:
             decode_prekey(body)
